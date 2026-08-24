@@ -1,0 +1,376 @@
+## EPITECH PROJECT, 2026
+## TARDIS
+## File description:
+## CI pipeline : lint (ruff), livrables, notebooks, dashboard, mirroring
+
+name: tardis
+
+"on":
+  push:
+  pull_request:
+
+# En trinome, 3 personnes poussent en parallele. On ne garde que le dernier
+# run par branche : les runs obsoletes sont annules au lieu de saturer la file.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # >>> A REMPLIR : URL SSH du repo miroir Epitech <<<
+  MIRROR_SSH_URL: "git@github.com:EpitechPGE1-2025/G-AIA-210-COT-2-2-tardis-2.git"
+  # Livrables imposes par le sujet (verifies par le job `deliverables`)
+  REQUIRED_FILES: "requirements.txt,tardis_eda.ipynb,tardis_model.ipynb,tardis_dashboard.py,README.md"
+  # Artefacts generes : absents du repo au depart, on avertit sans faire echouer
+  GENERATED_FILES: "cleaned_dataset.csv,model.joblib"
+  DASHBOARD_ENTRYPOINT: "tardis_dashboard.py"
+  PYTHON_VERSION: "3.11"
+  # Passer a "true" quand les notebooks sont censes tourner de bout en bout
+  RUN_NOTEBOOKS: "false"
+  # Passer a "true" pour que `ruff check` (lint) bloque, en plus du format
+  RUFF_LINT_STRICT: "false"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Garde-fou + decouverte dynamique du contenu du repo
+  # ---------------------------------------------------------------------------
+  guard:
+    name: Guard & discovery
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      notebooks: ${{ steps.discover.outputs.notebooks }}
+      has_notebooks: ${{ steps.discover.outputs.has_notebooks }}
+      has_tests: ${{ steps.discover.outputs.has_tests }}
+      has_dataset: ${{ steps.discover.outputs.has_dataset }}
+    steps:
+      - name: Check branch and repository
+        id: check
+        run: |
+          branch="${{ github.head_ref || github.ref_name }}"
+          if [[ "$branch" == no-ga/* ]] \
+            || [[ "$MIRROR_SSH_URL" == *"${{ github.repository }}"* ]]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check.outputs.proceed == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # La matrice des notebooks est construite depuis le repo, pas codee en dur :
+      # ajouter un .ipynb suffit pour qu'il soit teste.
+      - name: Discover repository content
+        id: discover
+        if: steps.check.outputs.proceed == 'true'
+        run: |
+          notebooks=$(find . -name '*.ipynb' -not -path './.git/*' \
+            -not -path '*/.ipynb_checkpoints/*' | sed 's|^\./||' | sort \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "notebooks=${notebooks}" >> "$GITHUB_OUTPUT"
+          [ "$notebooks" = "[]" ] && echo "has_notebooks=false" >> "$GITHUB_OUTPUT" \
+            || echo "has_notebooks=true" >> "$GITHUB_OUTPUT"
+          [ -d tests ] && echo "has_tests=true" >> "$GITHUB_OUTPUT" \
+            || echo "has_tests=false" >> "$GITHUB_OUTPUT"
+          [ -f dataset.csv ] && echo "has_dataset=true" >> "$GITHUB_OUTPUT" \
+            || echo "has_dataset=false" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Coding style : ruff format (impose par le sujet) + ruff check
+  # ---------------------------------------------------------------------------
+  coding_style:
+    name: Coding style (ruff)
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install --disable-pip-version-check ruff
+
+      # ruff comprend nativement les .ipynb : .py et notebooks sont couverts.
+      - name: Check formatting
+        id: format
+        run: |
+          if ! ruff format --check --diff .; then
+            echo "::error::Le code n'est pas formate. Lance 'ruff format .' en local."
+            exit 1
+          fi
+
+      - name: Lint
+        id: lint
+        continue-on-error: ${{ env.RUFF_LINT_STRICT != 'true' }}
+        run: ruff check --output-format=github .
+
+      - name: Report lint status
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "### Lint ruff : violations detectees" >> "$GITHUB_STEP_SUMMARY"
+          echo "Non bloquant (RUFF_LINT_STRICT=false)." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. Livrables : les fichiers imposes par le sujet existent et sont valides
+  # ---------------------------------------------------------------------------
+  deliverables:
+    name: Required deliverables
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Check required files exist
+        run: |
+          status=0
+          IFS=',' read -ra files <<< "$REQUIRED_FILES"
+          for f in "${files[@]}"; do
+            f="$(echo "$f" | xargs)"
+            [ -z "$f" ] && continue
+            if [ ! -f "$f" ]; then
+              echo "::error file=${f}::Livrable manquant : '${f}'"
+              status=1
+            elif [ ! -s "$f" ]; then
+              echo "::error file=${f}::Livrable vide : '${f}'"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Warn on missing generated artefacts
+        run: |
+          IFS=',' read -ra files <<< "$GENERATED_FILES"
+          for f in "${files[@]}"; do
+            f="$(echo "$f" | xargs)"
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || echo "::warning file=${f}::Artefact non versionne : '${f}'"
+          done
+
+      # Un .ipynb corrompu ou un notebook sans sortie passe inapercu jusqu'a la
+      # soutenance : on valide le JSON et on compte les cellules executees.
+      - name: Validate notebooks structure
+        if: needs.guard.outputs.has_notebooks == 'true'
+        run: |
+          status=0
+          for nb in $(find . -name '*.ipynb' -not -path './.git/*' \
+            -not -path '*/.ipynb_checkpoints/*'); do
+            if ! jq empty "$nb" 2>/dev/null; then
+              echo "::error file=${nb#./}::JSON invalide"
+              status=1
+              continue
+            fi
+            code=$(jq '[.cells[] | select(.cell_type=="code")] | length' "$nb")
+            run=$(jq '[.cells[] | select(.cell_type=="code")
+              | select(.execution_count != null)] | length' "$nb")
+            echo "- \`${nb#./}\` : ${run}/${code} cellules executees" \
+              >> "$GITHUB_STEP_SUMMARY"
+            if [ "$code" -gt 0 ] && [ "$run" -eq 0 ]; then
+              echo "::warning file=${nb#./}::Aucune cellule executee (sorties vides)"
+            fi
+          done
+          exit $status
+
+  # ---------------------------------------------------------------------------
+  # 4. Tests unitaires (job saute automatiquement s'il n'y a pas de tests/)
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Unit tests
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true' && needs.guard.outputs.has_tests == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --disable-pip-version-check -r requirements.txt
+          pip install --disable-pip-version-check pytest
+
+      - name: Run pytest
+        timeout-minutes: 5
+        run: pytest -q tests
+
+  # ---------------------------------------------------------------------------
+  # 5. Execution des notebooks : un job par notebook, en parallele
+  # ---------------------------------------------------------------------------
+  notebooks:
+    name: Execute ${{ matrix.notebook }}
+    needs: guard
+    if: >-
+      needs.guard.outputs.proceed == 'true'
+      && needs.guard.outputs.has_notebooks == 'true'
+      && needs.guard.outputs.has_dataset == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        notebook: ${{ fromJSON(needs.guard.outputs.notebooks) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --disable-pip-version-check -r requirements.txt
+          pip install --disable-pip-version-check nbconvert ipykernel
+
+      # RUN_NOTEBOOKS=false tant que les notebooks sont incomplets : on voit le
+      # resultat dans le summary sans bloquer les PR de l'equipe.
+      - name: Execute notebook
+        id: exec
+        timeout-minutes: 15
+        continue-on-error: ${{ env.RUN_NOTEBOOKS != 'true' }}
+        env:
+          MPLBACKEND: Agg
+        run: |
+          jupyter nbconvert --to notebook --execute \
+            --ExecutePreprocessor.timeout=600 \
+            --output "/tmp/executed.ipynb" "${{ matrix.notebook }}"
+
+      - name: Report execution status
+        run: |
+          if [ "${{ steps.exec.outcome }}" = "success" ]; then
+            echo ":white_check_mark: \`${{ matrix.notebook }}\` execute sans erreur" \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo ":x: \`${{ matrix.notebook }}\` a echoue a l'execution" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 6. Smoke test du dashboard : il doit demarrer et repondre
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: Streamlit smoke test
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      # Erreur de syntaxe ou import casse : detecte sans lancer le serveur.
+      - name: Byte-compile dashboard
+        run: python -m py_compile "$DASHBOARD_ENTRYPOINT"
+
+      - name: Start dashboard and probe health endpoint
+        timeout-minutes: 3
+        run: |
+          streamlit run "$DASHBOARD_ENTRYPOINT" \
+            --server.headless true \
+            --server.port 8501 \
+            --browser.gatherUsageStats false > streamlit.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8501/_stcore/health > /dev/null; then
+              echo "::notice::Dashboard demarre (tentative $i)"
+              kill $pid
+              exit 0
+            fi
+            kill -0 $pid 2>/dev/null || break
+            sleep 2
+          done
+          echo "::error file=${DASHBOARD_ENTRYPOINT}::Le dashboard n'a pas demarre"
+          cat streamlit.log
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # 7. Verdict unique : une seule "required check" a proteger sur main
+  # ---------------------------------------------------------------------------
+  verdict:
+    name: CI verdict
+    needs: [guard, coding_style, deliverables, tests, notebooks, dashboard]
+    if: always() && needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate job results
+        run: |
+          status=0
+          declare -A results=(
+            ["coding_style"]="${{ needs.coding_style.result }}"
+            ["deliverables"]="${{ needs.deliverables.result }}"
+            ["tests"]="${{ needs.tests.result }}"
+            ["notebooks"]="${{ needs.notebooks.result }}"
+            ["dashboard"]="${{ needs.dashboard.result }}"
+          )
+          echo "## Resultat CI" >> "$GITHUB_STEP_SUMMARY"
+          for job in "${!results[@]}"; do
+            r="${results[$job]}"
+            case "$r" in
+              success) icon=":white_check_mark:" ;;
+              skipped) icon=":fast_forward:" ;;
+              *) icon=":x:"; status=1 ;;
+            esac
+            echo "- ${icon} **${job}** : ${r}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $status
+
+  # ---------------------------------------------------------------------------
+  # 8. Mirroring : uniquement sur push, jamais sur une PR
+  # ---------------------------------------------------------------------------
+  push_to_mirror:
+    name: Push to Epitech mirror
+    needs: verdict
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Strip CI workflows from history before mirroring
+        run: |
+          pip install --user --quiet git-filter-repo
+          ~/.local/bin/git-filter-repo --force --invert-paths \
+            --path .github/workflows
+
+      - name: Set up SSH key
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.GIT_SSH_PRIVATE_KEY }}
+
+      - name: Add mirror host to known_hosts
+        run: ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      - name: Push filtered branch to mirror
+        run: |
+          git push --force "$MIRROR_SSH_URL" \
+            "HEAD:refs/heads/${{ github.ref_name }}"

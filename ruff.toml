@@ -1,0 +1,20 @@
+# Coding style impose par le sujet : ruff formatter.
+# Le format ci-dessous correspond aux defauts de ruff, ecrits explicitement
+# pour que les trois membres de l'equipe aient exactement le meme rendu.
+
+line-length = 88
+target-version = "py311"
+extend-include = ["*.ipynb"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# E501 : la longueur de ligne est deja geree par le formatter.
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Dans un notebook, une expression seule en fin de cellule sert a afficher.
+"*.ipynb" = ["B018", "F401"]
