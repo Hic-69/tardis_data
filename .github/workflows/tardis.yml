@@ -22,7 +22,8 @@ env:
   # >>> A REMPLIR : URL SSH du repo miroir Epitech <<<
   MIRROR_SSH_URL: "git@github.com:EpitechPGE1-2025/G-AIA-210-COT-2-2-tardis-2.git"
   # Livrables imposes par le sujet (verifies par le job `deliverables`)
-  REQUIRED_FILES: "requirements.txt,tardis_eda.ipynb,tardis_model.ipynb,tardis_dashboard.py,README.md"
+  # Etapes 1-3 : le dashboard (etape 4) sera ajoute ici quand il existera
+  REQUIRED_FILES: "requirements.txt,notebooks/tardis_eda.ipynb,notebooks/tardis_model.ipynb,README.md"
   # Artefacts generes : absents du repo au depart, on avertit sans faire echouer
   GENERATED_FILES: "cleaned_dataset.csv,model.joblib"
   DASHBOARD_ENTRYPOINT: "tardis_dashboard.py"
@@ -45,6 +46,7 @@ jobs:
       has_notebooks: ${{ steps.discover.outputs.has_notebooks }}
       has_tests: ${{ steps.discover.outputs.has_tests }}
       has_dataset: ${{ steps.discover.outputs.has_dataset }}
+      has_dashboard: ${{ steps.discover.outputs.has_dashboard }}
     steps:
       - name: Check branch and repository
         id: check
@@ -79,6 +81,9 @@ jobs:
             || echo "has_tests=false" >> "$GITHUB_OUTPUT"
           [ -f dataset.csv ] && echo "has_dataset=true" >> "$GITHUB_OUTPUT" \
             || echo "has_dataset=false" >> "$GITHUB_OUTPUT"
+          [ -f "$DASHBOARD_ENTRYPOINT" ] \
+            && echo "has_dashboard=true" >> "$GITHUB_OUTPUT" \
+            || echo "has_dashboard=false" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # 2. Coding style : ruff format (impose par le sujet) + ruff check
@@ -271,7 +276,9 @@ jobs:
   dashboard:
     name: Streamlit smoke test
     needs: guard
-    if: needs.guard.outputs.proceed == 'true'
+    if: >-
+      needs.guard.outputs.proceed == 'true'
+      && needs.guard.outputs.has_dashboard == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
